@@ -18,6 +18,10 @@ local VIEW_BUFFER_UPDATED_PATTERN = "AvanteViewBufferUpdated"
 local CODEBLOCK_KEYBINDING_NAMESPACE = api.nvim_create_namespace("AVANTE_CODEBLOCK_KEYBINDING")
 local PRIORITY = vim.highlight.priorities.user
 
+local diff_match_patch = require("avante.utils.diff_match_patch")
+local diff_cleanupSemantic = diff_match_patch.diff_cleanupSemantic
+local DIFF_DELETE = diff_match_patch.DIFF_DELETE
+
 ---@class avante.Sidebar
 local Sidebar = {}
 
@@ -256,7 +260,7 @@ local spinner_chars = {
   "⠐",
   "⠠",
   "⢀",
-  "⣀",
+  "",
   "⢄",
   "⢂",
   "⢁",
@@ -390,6 +394,83 @@ local function extract_code_snippets_map(response_content)
   end
 
   return snippets_map
+end
+
+---@param snippet AvanteCodeSnippet
+---@return AvanteCodeSnippet[]
+local function minimize_code_snippet(original_content, snippet)
+  -- Get the original file contents
+  local original_lines = vim.split(original_content, "\n")
+  local snippet_lines = vim.split(snippet.content, "\n")
+
+  -- Get the original code based on the snippet's range
+  local start_line = snippet.range[1]
+  local end_line = snippet.range[2]
+
+  -- Combine the lines being replaced into a single string
+  local original_code = table.concat(vim.list_slice(original_lines, start_line, end_line), "\n")
+
+  -- Compute the semantic diff between the original text and the snippet
+  local diffs = diff_match_patch.diff_main(original_code, snippet.content, true)
+  diff_cleanupSemantic(diffs)
+  print("416", vim.inspect(diffs))
+
+  local minimized_snippets = {}
+  local current_start_line = start_line
+  local current_end_line = start_line
+
+  for _, diff in ipairs(diffs) do
+    local diff_type = diff[1]
+    local diff_text = diff[2]
+
+    if diff_type == 0 then -- No change
+      -- for i = 1, #diff_text do
+      --   table.insert(current_snippet, snippet_lines[current_end_line - start_line + 1])
+      --   current_end_line = current_end_line + 1
+      -- end
+      current_end_line = current_end_line + #vim.split(diff_text, "\n")
+      -- Reset current start line since we only really want to extend the window based on deletions
+      current_start_line = current_end_line
+    elseif diff_type == -1 then -- Deletion, ignore
+      current_end_line = current_end_line + #vim.split(diff_text, "\n")
+    elseif diff_type == 1 then -- Addition
+      local new_snippet = {
+        range = { current_start_line, current_end_line },
+        content = diff_text,
+        lang = snippet.lang,
+        explanation = snippet.explanation,
+        start_line_in_response_buf = snippet.start_line_in_response_buf or 0,
+        end_line_in_response_buf = snippet.end_line_in_response_buf or 0,
+        filepath = snippet.filepath,
+      }
+      table.insert(minimized_snippets, new_snippet)
+    end
+  end
+
+  return minimized_snippets
+end
+
+---@param snippets_map table<string, AvanteCodeSnippet[]>
+---@return table<string, AvanteCodeSnippet[]>
+local function minimize_snippets(snippets_map)
+  print("minimize_snippets")
+  local minimized_snippets_map = {}
+
+  for filepath, snippets in pairs(snippets_map) do
+    local original_content = Utils.file.read_content(filepath) or ""
+    local minimized_snippets = {}
+
+    for _, snippet in ipairs(snippets) do
+      local minimized_snippets_list = minimize_code_snippet(original_content, snippet)
+      for _, minimized_snippet in ipairs(minimized_snippets_list) do
+        if minimized_snippet then table.insert(minimized_snippets, minimized_snippet) end
+      end
+    end
+
+    if #minimized_snippets > 0 then minimized_snippets_map[filepath] = minimized_snippets end
+  end
+
+  return minimized_snippets_map
 end
 
 ---@param snippets_map table<string, AvanteCodeSnippet[]>
@@ -537,18 +618,26 @@ function Sidebar:apply(current_cursor)
   local response, response_start_line = self:get_content_between_separators()
   local all_snippets_map = extract_code_snippets_map(response)
   all_snippets_map = ensure_snippets_no_overlap(all_snippets_map)
+  print("613")
+  print(vim.inspect(all_snippets_map))
+  if Config.options.behaviour.minimize_diff then all_snippets_map = minimize_snippets(all_snippets_map) end
+  print(vim.inspect(all_snippets_map))
   local selected_snippets_map = {}
   if current_cursor then
     if self.result and self.result.winid then
       local cursor_line = Utils.get_cursor_pos(self.result.winid)
       for filepath, snippets in pairs(all_snippets_map) do
         for _, snippet in ipairs(snippets) do
+          print("629", vim.inspect(snippet))
           if
             cursor_line >= snippet.start_line_in_response_buf + response_start_line - 1
             and cursor_line <= snippet.end_line_in_response_buf + response_start_line - 1
           then
-            selected_snippets_map[filepath] = { snippet }
-            break
+            if selected_snippets_map[filepath] == nil then
+              selected_snippets_map[filepath] = { snippet }
+            else
+              table.insert(selected_snippets_map[filepath], snippet)
+            end
           end
         end
       end
